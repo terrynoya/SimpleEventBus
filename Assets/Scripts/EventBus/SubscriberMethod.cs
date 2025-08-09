@@ -1,5 +1,4 @@
 ﻿using UnityEngine;
-using UnityEditor;
 using System.Reflection;
 using System;
 
@@ -10,4 +9,8 @@ public class SubscriberMethod
     
     public int Priority;
     public bool Sticky;
+
+    // 参数签名缓存
+    public int ParameterCount;
+    public Type ParameterType;
 }
