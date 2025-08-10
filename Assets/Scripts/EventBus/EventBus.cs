@@ -10,7 +10,8 @@ namespace UEventBus
     {
         private static EventBus _instance;
 
-        private Dictionary<int, List<Subscription>> _subMap;
+        private readonly Dictionary<int, List<Subscription>> _subMap;
+        private readonly Dictionary<Type, List<SubscriberMethod>> _methodCache = new Dictionary<Type, List<SubscriberMethod>>();
 
         public static EventBus Default
         {
@@ -63,22 +64,18 @@ namespace UEventBus
                 var sub = subList[i];
                 var sm = sub.Method;
 
-                if (sm.ParameterCount == 0)
+                // 优先使用已绑定委托
+                if (sub.NoArgAction != null)
                 {
-                    sm.Method.Invoke(sub.Subscriber, null);
+                    sub.NoArgAction();
                     continue;
                 }
 
-                if (sm.ParameterCount == 1)
+                if (sub.DataAction != null)
                 {
                     if (data == null)
                     {
-                        if (sm.ParameterType.IsValueType && Nullable.GetUnderlyingType(sm.ParameterType) == null)
-                        {
-                            Debug.LogWarning($"[EventBus] Skip invoke: event {eventId} expects non-null '{sm.ParameterType.Name}' but data is null. Method: {sm.Method.DeclaringType.FullName}.{sm.Method.Name}");
-                            continue;
-                        }
-                        sm.Method.Invoke(sub.Subscriber, new object[] { null });
+                        sub.DataAction(null);
                         continue;
                     }
 
@@ -87,7 +84,18 @@ namespace UEventBus
                         Debug.LogWarning($"[EventBus] Skip invoke: event {eventId} expects '{sm.ParameterType.Name}', got '{data.GetType().Name}'. Method: {sm.Method.DeclaringType.FullName}.{sm.Method.Name}");
                         continue;
                     }
+                    sub.DataAction((EventData)data);
+                    continue;
+                }
 
+                // 兼容：无委托缓存时回退反射调用（不建议出现）
+                if (sm.ParameterCount == 0)
+                {
+                    sm.Method.Invoke(sub.Subscriber, null);
+                    continue;
+                }
+                if (sm.ParameterCount == 1)
+                {
                     sm.Method.Invoke(sub.Subscriber, new object[] { data });
                     continue;
                 }
@@ -98,6 +106,11 @@ namespace UEventBus
 
         private List<SubscriberMethod> FindSubscriberMethods(Type subscriberClass)
         {
+            if (_methodCache.TryGetValue(subscriberClass, out var cached))
+            {
+                return cached;
+            }
+
             var rlt = new List<SubscriberMethod>();
             var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly;
             var methods = subscriberClass.GetMethods(flags);
@@ -140,6 +153,7 @@ namespace UEventBus
                     rlt.Add(m);
                 }
             }
+            _methodCache[subscriberClass] = rlt;
             return rlt;
         }
 
@@ -151,7 +165,38 @@ namespace UEventBus
                 _subMap.Add(eventId, new List<Subscription>());
             }
             var subList = _subMap[eventId];
-            subList.Add(new Subscription(subscriber, method));
+            var subscription = new Subscription(subscriber, method);
+
+            // 绑定委托以避免 Post 时反射
+            if (method.ParameterCount == 0)
+            {
+                try
+                {
+                    var action = (Action)method.Method.CreateDelegate(typeof(Action), subscriber);
+                    subscription.NoArgAction = action;
+                }
+                catch { /* 忽略，保留反射后备方案 */ }
+            }
+            else if (method.ParameterCount == 1)
+            {
+                try
+                {
+                    var paramType = method.ParameterType;
+                    if (paramType == typeof(EventData))
+                    {
+                        var action = (Action<EventData>)method.Method.CreateDelegate(typeof(Action<EventData>), subscriber);
+                        subscription.DataAction = action;
+                    }
+                    else
+                    {
+                        // 为派生类型生成包装委托
+                        subscription.DataAction = CreateDataActionWrapper(subscriber, method.Method, paramType);
+                    }
+                }
+                catch { /* 忽略，保留反射后备方案 */ }
+            }
+
+            subList.Add(subscription);
         }
 
         private void UnSubscribe(object subscriber, SubscriberMethod method)
@@ -176,6 +221,62 @@ namespace UEventBus
             {
                 subList.Remove(removeSubList[i]);
             }
+        }
+
+        // 非反射注册 API
+        public void Subscribe(int eventId, Action handler)
+        {
+            if (handler == null) throw new ArgumentNullException(nameof(handler));
+            if (!_subMap.ContainsKey(eventId))
+            {
+                _subMap.Add(eventId, new List<Subscription>());
+            }
+            _subMap[eventId].Add(new Subscription(handler, handler, null));
+        }
+
+        public void Subscribe<T>(int eventId, Action<T> handler) where T : EventData
+        {
+            if (handler == null) throw new ArgumentNullException(nameof(handler));
+            if (!_subMap.ContainsKey(eventId))
+            {
+                _subMap.Add(eventId, new List<Subscription>());
+            }
+            // 存储为统一的 Action<EventData> 包装
+            Action<EventData> wrapper = e => handler((T)e);
+            var sub = new Subscription(wrapper, handler, null)
+            {
+                // Method 仅用于日志，在非反射注册场景可为空
+                Method = new SubscriberMethod { EventId = eventId, ParameterCount = 1, ParameterType = typeof(T) }
+            };
+            _subMap[eventId].Add(sub);
+        }
+
+        public void UnSubscribe(int eventId, Action handler)
+        {
+            if (!_subMap.ContainsKey(eventId) || handler == null) return;
+            var subList = _subMap[eventId];
+            subList.RemoveAll(s => s.RawDelegate == (Delegate)handler || s.NoArgAction == handler);
+        }
+
+        public void UnSubscribe<T>(int eventId, Action<T> handler) where T : EventData
+        {
+            if (!_subMap.ContainsKey(eventId) || handler == null) return;
+            var subList = _subMap[eventId];
+            subList.RemoveAll(s => Equals(s.RawDelegate, handler));
+        }
+
+        private static Action<EventData> CreateDataActionWrapper(object target, MethodInfo method, Type paramType)
+        {
+            // 通过泛型辅助方法在注册阶段创建包装委托
+            var helper = typeof(EventBus).GetMethod(nameof(CreateWrapperGeneric), BindingFlags.NonPublic | BindingFlags.Static);
+            var generic = helper.MakeGenericMethod(paramType);
+            return (Action<EventData>)generic.Invoke(null, new object[] { target, method });
+        }
+
+        private static Action<EventData> CreateWrapperGeneric<T>(object target, MethodInfo method) where T : EventData
+        {
+            var typed = (Action<T>)method.CreateDelegate(typeof(Action<T>), target);
+            return (EventData e) => typed((T)e);
         }
     }
 }
